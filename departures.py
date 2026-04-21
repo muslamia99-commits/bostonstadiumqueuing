@@ -1,5 +1,11 @@
-import simpy
-import random
+import random 
+from random import seed
+import numpy as np
+import simpy 
+
+randome_seed = 42
+
+
 
 def train(env, name, stationplatform):
     # 1. Arrival
