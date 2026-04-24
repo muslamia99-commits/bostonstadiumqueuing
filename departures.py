@@ -29,7 +29,7 @@ import math
 RANDOM_SEED = 42
 
 # Stadium / Demand Parameters
-STADIUM_CAPACITY = 66_000          # Gillette Stadium seating
+STADIUM_CAPACITY = 65_000          # Gillette Stadium seating
 PARKING_REDUCTION = 0.75           # 75% fewer parking spots
 PRE_GAME_WINDOW_MIN = 180          # minutes before kickoff with significant arrivals
 POST_GAME_WINDOW_MIN = 90          # minutes after final whistle with significant departures
@@ -49,13 +49,13 @@ SIM_DURATION_MIN = PRE_GAME_WINDOW_MIN + POST_GAME_WINDOW_MIN  # total window mo
 # Game Profiles — 7 World Cup matches at Gillette
 # Each dict: kickoff_local (str), expected_fill_rate (0–1), day_of_week
 GAME_PROFILES = [
-    {"name": "Match 1",  "kickoff": "2:00 PM",  "fill_rate": 0.90, "day": "Weekday"},
-    {"name": "Match 2",  "kickoff": "5:00 PM",  "fill_rate": 0.95, "day": "Weekend"},
-    {"name": "Match 3",  "kickoff": "8:00 PM",  "fill_rate": 0.98, "day": "Weekday"},
-    {"name": "Match 4",  "kickoff": "2:00 PM",  "fill_rate": 0.85, "day": "Weekend"},
-    {"name": "Match 5",  "kickoff": "5:00 PM",  "fill_rate": 0.92, "day": "Weekday"},
-    {"name": "Match 6",  "kickoff": "8:00 PM",  "fill_rate": 1.00, "day": "Weekend"},
-    {"name": "Match 7",  "kickoff": "5:00 PM",  "fill_rate": 0.97, "day": "Weekend"},  # Final
+    {"name": "Match 1",  "kickoff": "2:00 PM",  "fill_rate": 0.90, "day": "Weekend"},
+    {"name": "Match 2",  "kickoff": "11:00 AM",  "fill_rate": 0.95, "day": "Weekday"},
+    {"name": "Match 3",  "kickoff": "11:00 AM",  "fill_rate": 0.98, "day": "Weekday"}, #Friday
+    {"name": "Match 4",  "kickoff": "9:00 AM",  "fill_rate": 0.85, "day": "Weekday"},
+    {"name": "Match 5",  "kickoff": "8:00 AM",  "fill_rate": 0.92, "day": "Weekday"}, #Friday
+    {"name": "Match 6",  "kickoff": "9:30 AM",  "fill_rate": 1.00, "day": "Weekday"},
+    {"name": "Match 7",  "kickoff": "9:00 AM",  "fill_rate": 0.97, "day": "Weekday"},  # Quarter Final
 ]
 
 # ─────────────────────────────────────────────
