@@ -21,26 +21,27 @@ POST_GAME_WINDOW_MIN = 30          # minutes after final whistle with significan
 TRAIN_CAPACITY = 180             # passengers per bi-level consist (4 cars × ~250)
 DWELL_TIME_MIN = 5.0               # fixed dwell time at South Station (minutes)
 TRAVEL_TIME_MIN = 55.0             # South Station → Foxboro express (minutes)
-TURNAROUND_TIME_MIN = 20.0         # time at Foxboro before return trip
-MAX_RAIL_RIDERSHIP = 20_000
+MAX_RAIL_RIDERSHIP = 20000
 
 # Platform / Infrastructure
-NUM_PLATFORMS = 2                  # usable platforms at South Station for Foxboro service
+NUM_PLATFORMS = 1                  # usable platforms at Foxboro for Service
 
 # Simulation Parameters
-SIM_DURATION_MIN = PRE_GAME_WINDOW_MIN + POST_GAME_WINDOW_MIN  # total window modeled
+SIM_DURATION_MIN = POST_GAME_WINDOW_MIN  # total window modeled
 
 # Game Profiles — 7 World Cup matches at Gillette
 # Each dict: kickoff_local (str), expected_fill_rate (0–1), day_of_week
 GAME_PROFILES = [
-    {"name": "Match 1",  "kickoff": "2:00 PM",  "fill_rate": 1.00, "day": "Weekend"},
-    {"name": "Match 2",  "kickoff": "11:00 AM",  "fill_rate": 1.00, "day": "Weekday"},
-    {"name": "Match 3",  "kickoff": "11:00 AM",  "fill_rate": 1.00, "day": "Weekday"}, #Friday
-    {"name": "Match 4",  "kickoff": "9:00 AM",  "fill_rate": 1.00, "day": "Weekday"},
-    {"name": "Match 5",  "kickoff": "8:00 AM",  "fill_rate": 1.00, "day": "Weekday"}, #Friday
-    {"name": "Match 6",  "kickoff": "9:30 AM",  "fill_rate": 1.00, "day": "Weekday"},
-    {"name": "Match 7",  "kickoff": "9:00 AM",  "fill_rate": 1.00, "day": "Weekday"},  #Quarter Final
-]
+   GAME_PROFILES = [
+    {"name": "Match 5: Haiti vs. Scotland, June 13th at 9 PM",  "Departure Time": "2:30 PM",  "fill_rate": 1.00, "day": "Weekend"},
+    {"name": "Match 18: Iraq vs. Norway, June 16th at 6 PM",  "Departure Time": "11:30 AM",  "fill_rate": 1.00, "day": "Weekday"},
+    {"name": "Match 30: Scotland vs. Morocco, June 19th at 6 PM",  "Departure Time": "11:30 AM",  "fill_rate": 1.00, "day": "Weekday"}, #Friday
+    {"name": "Match 45: England vs. Ghana, June 23rd at 4 PM",  "Departure Time": "9:30 AM",  "fill_rate": 1.00, "day": "Weekday"},
+    {"name": "Match 61: Norway vs. France, June 26th at 3 PM",  "Departure Time": "8:30 AM",  "fill_rate": 1.00, "day": "Weekday"}, #Friday
+    {"name": "Match 74: Round of 32 Game, June 29th at 4:30 PM",  "Departure Time": "10:00 AM",  "fill_rate": 1.00, "day": "Weekday"},
+    {"name": "Match 97: Quarter Finals. July 9th at 4 PM",  "Departure Time": "9:30 AM",  "fill_rate": 1.00, "day": "Weekday"},  #Quarter Final
+   ]
+ ]
 
 # ─────────────────────────────────────────────
 # SIMPY PROCESSES
@@ -200,7 +201,7 @@ def run_scenario(game: Dict,
     # Spread pre-game arrivals over PRE_GAME_WINDOW_MIN with a ramp-up shape
     # More passengers arrive in the final 60 min before kickoff
     # Model as average over the window, with peak ~2x average in final hour
-    avg_lam = rail_demand / PRE_GAME_WINDOW_MIN  # passengers per minute (mean)
+    avg_lam = MAX_RAIL_RIDERSHIP / POST_GAME_WINDOW_MIN  # passengers per minute (mean)
 
     # ── SimPy Simulation ─────────────────────────────────────────
     env = simpy.Environment()
@@ -216,9 +217,7 @@ def run_scenario(game: Dict,
     if verbose:
         print(f"\n{'='*60}")
         print(f"  {game['name']} | Kickoff: {game['kickoff']} | {game['day']}")
-        print(f"  Fill Rate: {game['fill_rate']*100:.0f}% | Est. Rail Riders: {rail_demand:,}")
         print(f"  Headway: {headway_min} min | Platforms: {num_platforms}")
-        print(f"  Erlang C P(wait) [analytical]: {p_wait_analytical*100:.2f}%")
         print(f"{'='*60}")
 
     env.run(until=SIM_DURATION_MIN)
@@ -227,10 +226,7 @@ def run_scenario(game: Dict,
     metrics.passengers_missed = len(platform.queue)
 
     sim_summary = metrics.summary()
-    sim_summary["erlang_c_p_wait_pct"] = round(p_wait_analytical * 100, 2)
-    sim_summary["estimated_rail_demand"] = rail_demand
     sim_summary["avg_arrival_rate_per_min"] = round(avg_lam, 2)
-    sim_summary["utilization_rho"] = round(avg_lam / (c * mu), 4)
     sim_summary["headway_min"] = headway_min
     sim_summary["game"] = game["name"]
 
@@ -254,29 +250,11 @@ def find_optimal_headway(game: Dict,
     -------
     dict with recommended headway and full sweep results
     """
-    shift = mode_shift_analysis(STADIUM_CAPACITY, game["fill_rate"], PARKING_REDUCTION)
-    lam = shift["estimated_rail_ridership"] / PRE_GAME_WINDOW_MIN
+    lam = shift["estimated_rail_ridership"] / POST_GAME_WINDOW_MIN
     mu = TRAIN_CAPACITY / DWELL_TIME_MIN
     c = NUM_PLATFORMS
 
-    results = []
-    for hw in headway_range:
-        # Trains per minute = 1/headway; but Erlang C uses server count, not headway
-        # For a fixed c-platform system, headway controls how many trains we CAN dispatch
-        # Use analytical formula for sweep
-        p_wait = erlang_c(c, lam, mu)
-        rho = lam / (c * mu)
-        results.append({
-            "headway_min": hw,
-            "p_wait_pct": round(p_wait * 100, 2),
-            "rho": round(rho, 4),
-            "feasible": p_wait <= target_p_wait
-        })
-
     # Recommended: smallest headway that satisfies constraint
-    feasible = [r for r in results if r["feasible"]]
-    recommended_hw = feasible[0]["headway_min"] if feasible else None
-
     return {
         "game": game["name"],
         "recommended_headway_min": recommended_hw,
@@ -336,16 +314,6 @@ if __name__ == "__main__":
     print("  MBTA FOXBORO LINE — 2026 FIFA WORLD CUP SIMULATION")
     print("="*60)
 
-    # ── 1. Mode Shift Analysis ────────────────────────────────────
-    print("\n── SECTION 1: MODE SHIFT ANALYSIS ──────────────────────────")
-    for game in GAME_PROFILES:
-        shift = mode_shift_analysis(STADIUM_CAPACITY, game["fill_rate"], PARKING_REDUCTION)
-        print(f"\n{game['name']} ({game['kickoff']}, {game['day']})")
-        print(f"  Attendance:               {shift['attendance']:,}")
-        print(f"  Reduced parking spots:    {shift['reduced_parking']:,}  (from {shift['original_parking']:,})")
-        print(f"  Persons displaced by car: {shift['persons_displaced']:,}")
-        print(f"  Estimated rail demand:    {shift['estimated_rail_ridership']:,}")
-        print(f"  New transit share:        {shift['new_transit_share_pct']}%")
 
     # ── 2. Optimal Headway Sweep (Erlang C) ──────────────────────
     print("\n\n── SECTION 2: OPTIMAL HEADWAY SWEEP (Target P(wait) < 5%) ─")

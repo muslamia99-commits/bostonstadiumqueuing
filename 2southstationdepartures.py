@@ -6,6 +6,11 @@ Models the Foxboro Express line as an M/D/c queue:
   - D: Deterministic train service (fixed capacity & dwell time)
   - c: Multiple trains running concurrently (configurable)
 
+Boarding Groups:
+  - Passengers are assigned to groups 1–5 based on arrival time window
+  - Group 1 = earliest arrivals (highest priority), Group 5 = latest (lowest)
+  - SimPy PriorityResource ensures earlier groups board first
+
 Research Questions Addressed:
   1. Mode shift required given 75% parking reduction
   2. Minimum service rate to keep P(wait) < 5%
@@ -29,33 +34,70 @@ import math
 RANDOM_SEED = 42
 
 # Stadium / Demand Parameters
-STADIUM_CAPACITY = 65_000          # Gillette Stadium seating
-PARKING_REDUCTION = 0.75           # 75% fewer parking spots
-PRE_GAME_WINDOW_MIN = 390          # minutes before each first train departure with significant arrivals
+STADIUM_CAPACITY = 65_000
+PARKING_REDUCTION = 0.75
+PRE_GAME_WINDOW_MIN = 390          # minutes before kickoff with significant arrivals
 
 # Train / Service Parameters (Deterministic — the D in M/D/c)
-TRAIN_CAPACITY = 180             # passengers per bi-level consist (4 cars × ~250)
+TRAIN_CAPACITY = 180
 DWELL_TIME_MIN = 5.0               # fixed dwell time at South Station (minutes)
-TRAVEL_TIME_MIN = 55.0             # South Station → Foxboro express (minutes)
+TRAVEL_TIME_MIN = 55.0
+TURNAROUND_TIME_MIN = 20.0
 MAX_RAIL_RIDERSHIP = 20_000
 
 # Platform / Infrastructure
-NUM_PLATFORMS = 2                  # usable platforms at South Station for Foxboro service
+NUM_PLATFORMS = 2
+
+# Boarding Groups
+NUM_BOARDING_GROUPS = 5            # passengers split into 5 groups by arrival time
+# Group 1 = first 1/5 of window (earliest arrivers, board first)
+# Group 5 = last 1/5 of window  (latest arrivers, board last)
+# SimPy priority: lower number = higher priority, so group number = priority value
 
 # Simulation Parameters
-SIM_DURATION_MIN = PRE_GAME_WINDOW_MIN # total window modeled
+SIM_DURATION_MIN = PRE_GAME_WINDOW_MIN
 
 # Game Profiles — 7 World Cup matches at Gillette
-# Each dict: departuretime_local (str), expected_fill_rate (0–1), day_of_week
 GAME_PROFILES = [
-    {"name": "Match 5: Haiti vs. Scotland, June 13th at 9 PM",  "Departure Time": "2:30 PM",  "fill_rate": 1.00, "day": "Weekend"},
-    {"name": "Match 18: Iraq vs. Norway, June 16th at 6 PM",  "Departure Time": "11:30 AM",  "fill_rate": 1.00, "day": "Weekday"},
-    {"name": "Match 30: Scotland vs. Morocco, June 19th at 6 PM",  "Departure Time": "11:30 AM",  "fill_rate": 1.00, "day": "Weekday"}, #Friday
-    {"name": "Match 45: England vs. Ghana, June 23rd at 4 PM",  "Departure Time": "9:30 AM",  "fill_rate": 1.00, "day": "Weekday"},
-    {"name": "Match 61: Norway vs. France, June 26th at 3 PM",  "Departure Time": "8:30 AM",  "fill_rate": 1.00, "day": "Weekday"}, #Friday
-    {"name": "Match 74: Round of 32 Game, June 29th at 4:30 PM",  "Departure Time": "10:00 AM",  "fill_rate": 1.00, "day": "Weekday"},
-    {"name": "Match 97: Quarter Finals. July 9th at 4 PM",  "Departure Time": "9:30 AM",  "fill_rate": 1.00, "day": "Weekday"},  #Quarter Final
+    {"name": "Match 5: Haiti vs. Scotland, June 13th at 9 PM",   "Departure Time": "2:30 PM",  "fill_rate": 1.00, "day": "Weekend"},
+    {"name": "Match 18: Iraq vs. Norway, June 16th at 6 PM",     "Departure Time": "11:30 AM", "fill_rate": 1.00, "day": "Weekday"},
+    {"name": "Match 30: Scotland vs. Morocco, June 19th at 6 PM","Departure Time": "11:30 AM", "fill_rate": 1.00, "day": "Weekday"},
+    {"name": "Match 45: England vs. Ghana, June 23rd at 4 PM",   "Departure Time": "9:30 AM",  "fill_rate": 1.00, "day": "Weekday"},
+    {"name": "Match 61: Norway vs. France, June 26th at 3 PM",   "Departure Time": "8:30 AM",  "fill_rate": 1.00, "day": "Weekday"},
+    {"name": "Match 74: Round of 32 Game, June 29th at 4:30 PM", "Departure Time": "10:00 AM", "fill_rate": 1.00, "day": "Weekday"},
+    {"name": "Match 97: Quarter Finals, July 9th at 4 PM",       "Departure Time": "9:30 AM",  "fill_rate": 1.00, "day": "Weekday"},
 ]
+
+
+# ─────────────────────────────────────────────
+# BOARDING GROUP ASSIGNMENT
+# ─────────────────────────────────────────────
+
+def assign_boarding_group(arrival_time: float,
+                           sim_duration: float,
+                           num_groups: int = NUM_BOARDING_GROUPS) -> int:
+    """
+    Assign a passenger to a boarding group based on when they arrive
+    within the simulation window.
+
+    The window is divided into equal slices:
+      - Group 1: arrives in first 1/num_groups of the window  (highest priority)
+      - Group N: arrives in last  1/num_groups of the window  (lowest priority)
+
+    Parameters
+    ----------
+    arrival_time : current simulation time when passenger arrives
+    sim_duration : total simulation window length
+    num_groups   : number of boarding groups (default 5)
+
+    Returns
+    -------
+    int in [1, num_groups] — lower = earlier arrival = higher boarding priority
+    """
+    slice_width = sim_duration / num_groups
+    group = int(arrival_time / slice_width) + 1
+    return min(group, num_groups)  # clamp to num_groups for edge case at end
+
 
 # ─────────────────────────────────────────────
 # ANALYTICAL TOOLS (Erlang C)
@@ -75,20 +117,14 @@ def erlang_c(c: int, lam: float, mu: float) -> float:
     -------
     P(wait) in [0, 1], or 1.0 if system is saturated (rho >= 1)
     """
-    rho = lam / (c * mu)  # utilization per server
+    rho = lam / (c * mu)
     if rho >= 1.0:
-        return 1.0  # system unstable
+        return 1.0
 
-    # Traffic intensity
     a = lam / mu
-
-    # Numerator of Erlang C
     numerator = (a ** c / math.factorial(c)) * (1 / (1 - rho))
-
-    # Denominator: sum_{k=0}^{c-1} a^k/k!  +  numerator
     erlang_b_sum = sum(a**k / math.factorial(k) for k in range(c))
     denominator = erlang_b_sum + numerator
-
     return numerator / denominator
 
 
@@ -109,11 +145,7 @@ def mode_shift_analysis(stadium_capacity: int,
     original_parking = 20_000
     reduced_parking = int(original_parking * (1 - parking_reduction))
 
-    # Persons who previously drove (rough estimate: 1 car per 2.5 attendees filling old lots)
     riders_displaced = (original_parking - reduced_parking) * 2.5
-
-    # Required rail ridership (displaced drivers who choose rail over rideshare/other)
-    # Assume 60% of displaced drivers shift to rail, 40% to rideshare/carpool
     rail_shift = min(riders_displaced * 0.60, MAX_RAIL_RIDERSHIP)
     new_transit_share = (baseline_transit_share * attendance + rail_shift) / attendance
 
@@ -138,11 +170,17 @@ class Metrics:
     queue_lengths: List[float] = field(default_factory=list)
     train_loads: List[int] = field(default_factory=list)
     passengers_boarded: int = 0
-    passengers_missed: int = 0   # arrived but sim ended before boarding
+    passengers_missed: int = 0
     timestamps: List[float] = field(default_factory=list)
 
-    def record_wait(self, wait: float):
+    # Per-group wait time tracking — keyed by group number 1..NUM_BOARDING_GROUPS
+    group_wait_times: Dict[int, List[float]] = field(
+        default_factory=lambda: {g: [] for g in range(1, NUM_BOARDING_GROUPS + 1)}
+    )
+
+    def record_wait(self, wait: float, group: int):
         self.wait_times.append(wait)
+        self.group_wait_times[group].append(wait)
 
     def record_queue(self, t: float, length: int):
         self.timestamps.append(t)
@@ -155,7 +193,8 @@ class Metrics:
     def summary(self) -> Dict:
         if not self.wait_times:
             return {"error": "No data collected"}
-        return {
+
+        result = {
             "avg_wait_min":        round(np.mean(self.wait_times), 2),
             "p95_wait_min":        round(np.percentile(self.wait_times, 95), 2),
             "max_wait_min":        round(np.max(self.wait_times), 2),
@@ -168,92 +207,88 @@ class Metrics:
             "passengers_missed":   self.passengers_missed,
         }
 
+        # Append per-group average wait times to summary
+        for g, waits in self.group_wait_times.items():
+            result[f"group_{g}_avg_wait_min"] = round(np.mean(waits), 2) if waits else None
+
+        return result
+
 
 # ─────────────────────────────────────────────
 # SIMPY PROCESSES
 # ─────────────────────────────────────────────
 
 def passenger_generator(env: simpy.Environment,
-                         platform: simpy.Resource,
+                         platform: simpy.PriorityResource,
                          metrics: Metrics,
-                         lam_per_min: float,
-                         phase: str = "pre_game"):
+                         lam_per_min: float):
     """
     Generate passengers according to a Poisson process (M in M/D/c).
-
-    Arrival rate `lam_per_min` varies by phase:
-      - pre_game: ramps up toward kickoff
-      - post_game: burst immediately after final whistle
+    Each passenger is assigned a boarding group on arrival, which
+    determines their priority in the PriorityResource queue.
     """
-    t = 0
     while True:
-        # Poisson inter-arrival: exponential with mean 1/lambda
         inter_arrival = random.expovariate(lam_per_min)
         yield env.timeout(inter_arrival)
-        t += inter_arrival
-
-        # Spawn a passenger process
         env.process(passenger(env, platform, metrics))
 
 
 def passenger(env: simpy.Environment,
-              platform: simpy.Resource,
+              platform: simpy.PriorityResource,
               metrics: Metrics):
     """
-    A single passenger arrives, waits for a train, and boards.
-    Models the customer side of the M/D/c queue.
+    A single passenger arrives, gets assigned a boarding group based on
+    their arrival time, then waits in priority queue.
+
+    SimPy PriorityResource: lower priority value = served first.
+    Group 1 (earliest arrivers) gets priority=1 → boards before Group 5.
     """
     arrive_time = env.now
 
-    # Record queue snapshot
+    # Assign boarding group based on when in the window this passenger arrives
+    group = assign_boarding_group(arrive_time, SIM_DURATION_MIN)
+
+    # Record queue snapshot before joining
     metrics.record_queue(arrive_time, len(platform.queue))
 
-    # Request a spot on the next available train (via platform resource)
-    with platform.request() as req:
+    # Request platform with priority = group number
+    # Group 1 (priority=1) is served before Group 5 (priority=5)
+    with platform.request(priority=group) as req:
         yield req
         wait = env.now - arrive_time
-        metrics.record_wait(wait)
-        # Boarding itself is deterministic (absorbed into train dwell process)
-        yield env.timeout(0)  # instantaneous — dwell handled in train process
+        metrics.record_wait(wait, group)   # track wait by group
+        yield env.timeout(0)               # boarding absorbed into train dwell
 
 
 def train_dispatcher(env: simpy.Environment,
-                     platform: simpy.Resource,
+                     platform: simpy.PriorityResource,
                      metrics: Metrics,
                      headway_min: float,
                      sim_duration: float):
     """
     Dispatch trains on a fixed headway (D in M/D/c — deterministic service).
-
-    Each train:
-      1. Occupies a platform slot
-      2. Dwells for DWELL_TIME_MIN (fixed)
-      3. Boards up to TRAIN_CAPACITY passengers from the queue
-      4. Departs
     """
     train_id = 0
     while env.now < sim_duration:
-        yield env.timeout(headway_min)  # fixed schedule interval
+        yield env.timeout(headway_min)
         train_id += 1
         env.process(train_service(env, platform, metrics, f"Train {train_id}"))
 
 
 def train_service(env: simpy.Environment,
-                  platform: simpy.Resource,
+                  platform: simpy.PriorityResource,
                   metrics: Metrics,
                   name: str):
     """
-    A single train's service cycle at South Station / Foxboro.
-    Deterministic dwell time — the D in M/D/c.
+    A single train's service cycle. Deterministic dwell time.
+    PriorityResource ensures group 1 passengers board before group 5.
     """
     arrive = env.now
-    print(f"  [{arrive:6.1f} min] {name} arrives at platform | Queue: {len(platform.queue)}")
+    print(f"  [{arrive:6.1f} min] {name} arrives | Queue: {len(platform.queue)}")
 
-    # Fixed dwell — deterministic service time
+    # Fixed dwell — deterministic service time (the D in M/D/c)
     yield env.timeout(DWELL_TIME_MIN)
 
-    # Count how many passengers were served (limited by capacity)
-    # Passengers already holding platform.request() are "boarded"
     passengers_this_train = min(platform.capacity, TRAIN_CAPACITY)
     metrics.record_train(passengers_this_train)
 
@@ -271,58 +306,41 @@ def run_scenario(game: Dict,
                  verbose: bool = True) -> Dict:
     """
     Run a full pre-game arrival simulation for one World Cup match.
-
-    Parameters
-    ----------
-    game         : game profile dict (from GAME_PROFILES)
-    headway_min  : train frequency in minutes (what we're optimizing)
-    num_platforms: number of concurrent train slots (c in M/D/c)
-    verbose      : print train-level events
-
-    Returns
-    -------
-    dict with simulation metrics + analytical Erlang C comparison
+    Uses PriorityResource so boarding groups are respected.
     """
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
 
-    # ── Demand estimation ──────────────────────────────────────────
     shift = mode_shift_analysis(STADIUM_CAPACITY, game["fill_rate"], PARKING_REDUCTION)
     rail_demand = shift["estimated_rail_ridership"]
+    avg_lam = rail_demand / PRE_GAME_WINDOW_MIN
 
-    # Spread pre-game arrivals over PRE_GAME_WINDOW_MIN with a ramp-up shape
-    # More passengers arrive in the final 60 min before kickoff
-    # Model as average over the window, with peak ~2x average in final hour
-    avg_lam = rail_demand / PRE_GAME_WINDOW_MIN  # passengers per minute (mean)
-
-    # ── Analytical: Erlang C ──────────────────────────────────────
-    # Service rate: one train serves TRAIN_CAPACITY pax in DWELL_TIME_MIN
-    mu = TRAIN_CAPACITY / DWELL_TIME_MIN          # passengers per minute per "server"
-    c = num_platforms                              # concurrent trains
+    mu = TRAIN_CAPACITY / DWELL_TIME_MIN
+    c = num_platforms
     p_wait_analytical = erlang_c(c, avg_lam, mu)
 
-    # ── SimPy Simulation ─────────────────────────────────────────
     env = simpy.Environment()
     metrics = Metrics()
 
-    # Platform resource: c = num_platforms (each can hold one train at a time)
-    platform = simpy.Resource(env, capacity=num_platforms)
+    # KEY CHANGE: PriorityResource instead of Resource
+    # This is what enforces boarding group order —
+    # passengers with lower group numbers (earlier arrivals) get served first
+    platform = simpy.PriorityResource(env, capacity=num_platforms)
 
-    # Launch passenger generator and train dispatcher
     env.process(passenger_generator(env, platform, metrics, avg_lam))
     env.process(train_dispatcher(env, platform, metrics, headway_min, SIM_DURATION_MIN))
 
     if verbose:
         print(f"\n{'='*60}")
-        print(f"  {game['name']} | 1st train departure: {game['departuretime']} | {game['day']}")
+        print(f"  {game['name']} | {game['day']}")
         print(f"  Fill Rate: {game['fill_rate']*100:.0f}% | Est. Rail Riders: {rail_demand:,}")
         print(f"  Headway: {headway_min} min | Platforms: {num_platforms}")
+        print(f"  Boarding Groups: {NUM_BOARDING_GROUPS} (by arrival time window)")
         print(f"  Erlang C P(wait) [analytical]: {p_wait_analytical*100:.2f}%")
         print(f"{'='*60}")
 
     env.run(until=SIM_DURATION_MIN)
 
-    # Mark unboarded passengers as missed
     metrics.passengers_missed = len(platform.queue)
 
     sim_summary = metrics.summary()
@@ -341,17 +359,6 @@ def find_optimal_headway(game: Dict,
                          target_p_wait: float = 0.05) -> Dict:
     """
     Sweep headway values and find the minimum headway to keep P(wait) < target.
-    Uses the Erlang C formula for fast analytical sweep, then confirms with SimPy.
-
-    Parameters
-    ----------
-    game           : game profile
-    headway_range  : headway values to test (minutes)
-    target_p_wait  : threshold (default 5% per research question 2)
-
-    Returns
-    -------
-    dict with recommended headway and full sweep results
     """
     shift = mode_shift_analysis(STADIUM_CAPACITY, game["fill_rate"], PARKING_REDUCTION)
     lam = shift["estimated_rail_ridership"] / PRE_GAME_WINDOW_MIN
@@ -360,9 +367,6 @@ def find_optimal_headway(game: Dict,
 
     results = []
     for hw in headway_range:
-        # Trains per minute = 1/headway; but Erlang C uses server count, not headway
-        # For a fixed c-platform system, headway controls how many trains we CAN dispatch
-        # Use analytical formula for sweep
         p_wait = erlang_c(c, lam, mu)
         rho = lam / (c * mu)
         results.append({
@@ -372,7 +376,6 @@ def find_optimal_headway(game: Dict,
             "feasible": p_wait <= target_p_wait
         })
 
-    # Recommended: smallest headway that satisfies constraint
     feasible = [r for r in results if r["feasible"]]
     recommended_hw = feasible[0]["headway_min"] if feasible else None
 
@@ -394,24 +397,12 @@ def regular_rider_impact(headway_express_min: float,
     """
     Estimate the impact of express World Cup service on regular Foxboro/Franklin
     line riders (Research Question 3).
-
-    When express trains consume platform capacity, regular trains may be delayed
-    or cancelled. This function estimates the capacity conflict.
-
-    Parameters
-    ----------
-    headway_express_min    : headway between World Cup express trains
-    regular_trains_per_hour: baseline Franklin/Foxboro local service frequency
-    regular_rider_count    : typical non-event ridership on the line per hour
     """
     express_per_hour = 60 / headway_express_min
     total_trains_per_hour = express_per_hour + regular_trains_per_hour
     platform_utilization = total_trains_per_hour / (NUM_PLATFORMS * (60 / DWELL_TIME_MIN))
 
-    # If utilization > 1, regular trains will face delays
-    delay_risk = platform_utilization > 0.85  # flag at 85% utilization
-
-    # Estimate regular riders affected: proportion of hour dominated by express
+    delay_risk = platform_utilization > 0.85
     express_fraction = express_per_hour / total_trains_per_hour
     riders_impacted = int(regular_rider_count * express_fraction)
 
@@ -433,16 +424,17 @@ if __name__ == "__main__":
 
     print("\n" + "="*60)
     print("  MBTA FOXBORO LINE — 2026 FIFA WORLD CUP SIMULATION")
+    print(f"  Boarding Groups: {NUM_BOARDING_GROUPS} (by arrival time window)")
     print("="*60)
 
     # ── 1. Mode Shift Analysis ────────────────────────────────────
     print("\n── SECTION 1: MODE SHIFT ANALYSIS ──────────────────────────")
     for game in GAME_PROFILES:
         shift = mode_shift_analysis(STADIUM_CAPACITY, game["fill_rate"], PARKING_REDUCTION)
-        print(f"\n{game['name']} ({game['departuretime']}, {game['day']})")
+        print(f"\n{game['name']} ({game['Departure Time']}, {game['day']})")
         print(f"  Attendance:               {shift['attendance']:,}")
         print(f"  Reduced parking spots:    {shift['reduced_parking']:,}  (from {shift['original_parking']:,})")
-        print(f"  Persons displaced by car: {shift['persons_displaced']:,}")
+        print(f"  Persons displaced by car: {shift['riders_displaced']:,}")
         print(f"  Estimated rail demand:    {shift['estimated_rail_ridership']:,}")
         print(f"  New transit share:        {shift['new_transit_share_pct']}%")
 
@@ -458,12 +450,12 @@ if __name__ == "__main__":
             print(f"  {row['headway_min']:>7}m | {row['p_wait_pct']:>7}% | {row['rho']:>6.4f} | {ok:>5}")
 
     # ── 3. Full SimPy Simulation — Representative Games ──────────
-    print("\n\n── SECTION 3: SIMPY SIMULATION — SELECTED MATCHES ─────────")
+    print("\n\n── SECTION 3: SIMPY SIMULATION BOSTON STADIUM MATCH ─────────")
     for game in GAME_PROFILES:
         result = run_scenario(game, headway_min=15, num_platforms=NUM_PLATFORMS)
         print(f"\n  Simulation Results for {game['name']}:")
         for k, v in result.items():
-            if k not in ("game",):
+            if k != "game":
                 print(f"    {k:<35} {v}")
 
     # ── 4. Regular Rider Impact ───────────────────────────────────
