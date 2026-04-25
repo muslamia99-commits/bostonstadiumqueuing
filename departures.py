@@ -35,7 +35,7 @@ PRE_GAME_WINDOW_MIN = 180          # minutes before kickoff with significant arr
 POST_GAME_WINDOW_MIN = 90          # minutes after final whistle with significant departures
 
 # Train / Service Parameters (Deterministic — the D in M/D/c)
-TRAIN_CAPACITY = 1_000             # passengers per bi-level consist (4 cars × ~250)
+TRAIN_CAPACITY = 180             # passengers per bi-level consist (4 cars × ~250)
 DWELL_TIME_MIN = 5.0               # fixed dwell time at South Station (minutes)
 TRAVEL_TIME_MIN = 55.0             # South Station → Foxboro express (minutes)
 TURNAROUND_TIME_MIN = 20.0         # time at Foxboro before return trip
