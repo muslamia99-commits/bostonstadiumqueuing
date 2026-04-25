@@ -1,22 +1,6 @@
-"""
-MBTA Foxboro Commuter Rail - 2026 FIFA World Cup Service Simulation
-====================================================================
-Models the Foxboro Express line as an M/D/c queue:
-  - M: Poisson passenger arrivals (stochastic demand)
-  - D: Deterministic train service (fixed capacity & dwell time)
-  - c: Multiple trains running concurrently (configurable)
-
-Research Questions Addressed:
-  1. Mode shift required given 75% parking reduction
-  2. Minimum service rate to keep P(wait) < 5%
-  3. Impact on regular Foxboro/Franklin line riders
-
-Usage:
-    python foxboro_simulation.py
-"""
-
 import simpy
 import numpy as np
+import matplotlib.pyplot as plt
 import random
 from dataclasses import dataclass, field
 from typing import List, Dict
@@ -31,14 +15,14 @@ RANDOM_SEED = 42
 # Stadium / Demand Parameters
 STADIUM_CAPACITY = 65_000          # Gillette Stadium seating
 PARKING_REDUCTION = 0.75           # 75% fewer parking spots
-PRE_GAME_WINDOW_MIN = 180          # minutes before kickoff with significant arrivals
-POST_GAME_WINDOW_MIN = 90          # minutes after final whistle with significant departures
+POST_GAME_WINDOW_MIN = 30          # minutes after final whistle with significant departures
 
 # Train / Service Parameters (Deterministic — the D in M/D/c)
 TRAIN_CAPACITY = 180             # passengers per bi-level consist (4 cars × ~250)
 DWELL_TIME_MIN = 5.0               # fixed dwell time at South Station (minutes)
 TRAVEL_TIME_MIN = 55.0             # South Station → Foxboro express (minutes)
 TURNAROUND_TIME_MIN = 20.0         # time at Foxboro before return trip
+MAX_RAIL_RIDERSHIP = 20_000
 
 # Platform / Infrastructure
 NUM_PLATFORMS = 2                  # usable platforms at South Station for Foxboro service
@@ -49,89 +33,18 @@ SIM_DURATION_MIN = PRE_GAME_WINDOW_MIN + POST_GAME_WINDOW_MIN  # total window mo
 # Game Profiles — 7 World Cup matches at Gillette
 # Each dict: kickoff_local (str), expected_fill_rate (0–1), day_of_week
 GAME_PROFILES = [
-    {"name": "Match 1",  "kickoff": "2:00 PM",  "fill_rate": 0.90, "day": "Weekend"},
-    {"name": "Match 2",  "kickoff": "11:00 AM",  "fill_rate": 0.95, "day": "Weekday"},
-    {"name": "Match 3",  "kickoff": "11:00 AM",  "fill_rate": 0.98, "day": "Weekday"}, #Friday
-    {"name": "Match 4",  "kickoff": "9:00 AM",  "fill_rate": 0.85, "day": "Weekday"},
-    {"name": "Match 5",  "kickoff": "8:00 AM",  "fill_rate": 0.92, "day": "Weekday"}, #Friday
+    {"name": "Match 1",  "kickoff": "2:00 PM",  "fill_rate": 1.00, "day": "Weekend"},
+    {"name": "Match 2",  "kickoff": "11:00 AM",  "fill_rate": 1.00, "day": "Weekday"},
+    {"name": "Match 3",  "kickoff": "11:00 AM",  "fill_rate": 1.00, "day": "Weekday"}, #Friday
+    {"name": "Match 4",  "kickoff": "9:00 AM",  "fill_rate": 1.00, "day": "Weekday"},
+    {"name": "Match 5",  "kickoff": "8:00 AM",  "fill_rate": 1.00, "day": "Weekday"}, #Friday
     {"name": "Match 6",  "kickoff": "9:30 AM",  "fill_rate": 1.00, "day": "Weekday"},
-    {"name": "Match 7",  "kickoff": "9:00 AM",  "fill_rate": 0.97, "day": "Weekday"},  # Quarter Final
+    {"name": "Match 7",  "kickoff": "9:00 AM",  "fill_rate": 1.00, "day": "Weekday"},  #Quarter Final
 ]
 
 # ─────────────────────────────────────────────
-# ANALYTICAL TOOLS (Erlang C)
+# SIMPY PROCESSES
 # ─────────────────────────────────────────────
-
-def erlang_c(c: int, lam: float, mu: float) -> float:
-    """
-    Compute the Erlang C probability — P(arriving customer must wait).
-
-    Parameters
-    ----------
-    c   : number of servers (trains per hour)
-    lam : arrival rate (passengers per minute)
-    mu  : service rate per server (passengers per minute, = capacity / dwell)
-
-    Returns
-    -------
-    P(wait) in [0, 1], or 1.0 if system is saturated (rho >= 1)
-    """
-    rho = lam / (c * mu)  # utilization per server
-    if rho >= 1.0:
-        return 1.0  # system unstable
-
-    # Traffic intensity
-    a = lam / mu
-
-    # Numerator of Erlang C
-    numerator = (a ** c / math.factorial(c)) * (1 / (1 - rho))
-
-    # Denominator: sum_{k=0}^{c-1} a^k/k!  +  numerator
-    erlang_b_sum = sum(a**k / math.factorial(k) for k in range(c))
-    denominator = erlang_b_sum + numerator
-
-    return numerator / denominator
-
-
-def mode_shift_analysis(stadium_capacity: int,
-                        fill_rate: float,
-                        parking_reduction: float,
-                        baseline_transit_share: float = 0.10) -> Dict:
-    """
-    Estimate the required mode shift to commuter rail after parking reduction.
-
-    Assumptions
-    -----------
-    - Baseline: ~10% of attendees use transit for typical NFL games
-    - Average car occupancy: 2.5 persons
-    - Parking removed = demand that must shift to transit or other modes
-    """
-    attendance = int(stadium_capacity * fill_rate)
-    original_parking = 20_000
-    reduced_parking = int(original_parking * (1 - parking_reduction))
-
-    # Persons who previously drove (rough estimate: 1 car per 2.5 attendees filling old lots)
-    persons_displaced = (original_parking - reduced_parking) * 2.5
-
-    # Required rail ridership (displaced drivers who choose rail over rideshare/other)
-    # Assume 60% of displaced drivers shift to rail, 40% to rideshare/carpool
-    rail_shift = persons_displaced * 0.60
-    new_transit_share = (baseline_transit_share * attendance + rail_shift) / attendance
-
-    return {
-        "attendance": attendance,
-        "original_parking": original_parking,
-        "reduced_parking": reduced_parking,
-        "persons_displaced": int(persons_displaced),
-        "estimated_rail_ridership": int(rail_shift),
-        "new_transit_share_pct": round(new_transit_share * 100, 1),
-    }
-
-
-# ─────────────────────────────────────────────
-# METRICS COLLECTOR
-# ─────────────────────────────────────────────
-
 @dataclass
 class Metrics:
     """Collects per-passenger and per-train statistics during simulation."""
@@ -168,11 +81,6 @@ class Metrics:
             "passengers_boarded":  self.passengers_boarded,
             "passengers_missed":   self.passengers_missed,
         }
-
-
-# ─────────────────────────────────────────────
-# SIMPY PROCESSES
-# ─────────────────────────────────────────────
 
 def passenger_generator(env: simpy.Environment,
                          platform: simpy.Resource,
@@ -287,20 +195,12 @@ def run_scenario(game: Dict,
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
 
-    # ── Demand estimation ──────────────────────────────────────────
-    shift = mode_shift_analysis(STADIUM_CAPACITY, game["fill_rate"], PARKING_REDUCTION)
-    rail_demand = shift["estimated_rail_ridership"]
+   
 
     # Spread pre-game arrivals over PRE_GAME_WINDOW_MIN with a ramp-up shape
     # More passengers arrive in the final 60 min before kickoff
     # Model as average over the window, with peak ~2x average in final hour
     avg_lam = rail_demand / PRE_GAME_WINDOW_MIN  # passengers per minute (mean)
-
-    # ── Analytical: Erlang C ──────────────────────────────────────
-    # Service rate: one train serves TRAIN_CAPACITY pax in DWELL_TIME_MIN
-    mu = TRAIN_CAPACITY / DWELL_TIME_MIN          # passengers per minute per "server"
-    c = num_platforms                              # concurrent trains
-    p_wait_analytical = erlang_c(c, avg_lam, mu)
 
     # ── SimPy Simulation ─────────────────────────────────────────
     env = simpy.Environment()
