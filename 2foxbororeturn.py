@@ -7,302 +7,214 @@ Key assumptions:
   - Service begins 30 minutes after the final whistle
   - 1 platform available at Foxboro for boarding
   - 14 trains total dispatched (FCFS — no boarding groups)
-  - Train capacity: 180 passengers
+  - Train capacity: 1,440 passengers
   - Dwell time: 5 minutes (deterministic)
   - Travel time back to South Station: 55 minutes
-  - Passengers arrive at Foxboro station via Poisson process
+  - Headway: 15 minutes between trains
 
-Outputs:
-  - Console log of each train departure
-  - Cumulative departure plot (passengers vs. time)
-  - Required arrival rate λ to fill all 14 trains
-  - Total time to clear the stadium via rail
+Three arrival scenarios are modeled:
+  1. Normal distribution peak at t=30 (first train, early surge)
+  2. Normal distribution peak at t=120 (around train 7, late surge)
+  3. Uniform arrival rate across the entire 14-train service window
 """
 
-import simpy
 import numpy as np
-import random
-import math
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
-from dataclasses import dataclass, field
-from typing import List, Dict
+
+from scipy.stats import norm
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
 
-RANDOM_SEED = 42
+TRAIN_CAPACITY     = 1440     # passengers per train
+NUM_TRAINS         = 14       # total return trains
+FIRST_DEPARTURE    = 30       # minutes after whistle for train 1
+HEADWAY_MIN        = 15       # minutes between trains
+TRAVEL_TIME_MIN    = 55       # Foxboro → South Station
 
-# Train / Service Parameters
-TRAIN_CAPACITY       = 180     # passengers per train
-DWELL_TIME_MIN       = 5.0     # fixed dwell at Foxboro platform (deterministic)
-TRAVEL_TIME_MIN      = 55.0    # Foxboro → South Station
-NUM_TRAINS           = 14      # total return trains to dispatch
-NUM_PLATFORMS        = 1       # only 1 platform at Foxboro for return service
+TOTAL_PASSENGERS   = NUM_TRAINS * TRAIN_CAPACITY   # 20,160
 
-# Post-game timing
-WHISTLE_TO_SERVICE   = 30      # minutes after final whistle before first train departs
-HEADWAY_MIN          = 10      # minutes between trains (fixed schedule)
+# Derived timing
+LAST_DEPARTURE     = FIRST_DEPARTURE + (NUM_TRAINS - 1) * HEADWAY_MIN   # 225 min
+T_MAX              = LAST_DEPARTURE + 20                                  # plot window
 
-# Total simulation window: time from whistle to last possible train departure
-# 30 min delay + (14 trains × 10 min headway) + buffer
-SIM_DURATION_MIN     = WHISTLE_TO_SERVICE + (NUM_TRAINS * HEADWAY_MIN) + 30
+# Fine time axis for smooth curves
+T = np.linspace(0, T_MAX, 2000)
 
-
-# ─────────────────────────────────────────────
-# ARRIVAL RATE ANALYSIS
-# ─────────────────────────────────────────────
-
-def required_arrival_rate(num_trains: int,
-                           train_capacity: int,
-                           service_start_min: int,
-                           headway_min: float) -> Dict:
-    """
-    Calculate the arrival rate λ needed to fill all trains.
-
-    Total demand = num_trains × train_capacity passengers.
-    These passengers must arrive before the last train departs.
-
-    Last train departs at: service_start + (num_trains - 1) × headway + dwell
-    So passengers must arrive across that full window.
-
-    Returns
-    -------
-    dict with λ, total demand, window length, and trains × capacity breakdown
-    """
-    total_demand      = num_trains * train_capacity
-    last_departure    = service_start_min + (num_trains - 1) * headway_min + DWELL_TIME_MIN
-    arrival_window    = last_departure  # passengers arrive from t=0 (whistle) onward
-
-    # λ needed so that E[arrivals] = total_demand over the window
-    lam_per_min       = total_demand / arrival_window
-
-    # Also compute how long it takes all 14 trains to complete the trip to South Station
-    last_train_arrival_ss = last_departure + TRAVEL_TIME_MIN
-
-    return {
-        "total_passengers_needed":    total_demand,
-        "arrival_window_min":         round(arrival_window, 1),
-        "required_lam_per_min":       round(lam_per_min, 3),
-        "required_lam_per_hour":      round(lam_per_min * 60, 1),
-        "first_train_departs_min":    service_start_min + DWELL_TIME_MIN,
-        "last_train_departs_min":     round(last_departure, 1),
-        "last_train_arrival_SS_min":  round(last_train_arrival_ss, 1),
-        "total_elapsed_min":          round(last_train_arrival_ss, 1),
-    }
+# Train departure times
+TRAIN_DEPARTS = [FIRST_DEPARTURE + i * HEADWAY_MIN for i in range(NUM_TRAINS)]
 
 
 # ─────────────────────────────────────────────
-# METRICS COLLECTOR
+# ARRIVAL DENSITY FUNCTIONS
 # ─────────────────────────────────────────────
 
-@dataclass
-class ReturnMetrics:
-    wait_times:           List[float] = field(default_factory=list)
-    queue_at_departure:   List[int]   = field(default_factory=list)
-    train_loads:          List[int]   = field(default_factory=list)
-    departure_times:      List[float] = field(default_factory=list)
-    arrival_times_ss:     List[float] = field(default_factory=list)
-    platform_arrivals:    List[float] = field(default_factory=list)  # NEW: timestamp of each arrival
-    passengers_boarded:   int         = 0
-    passengers_stranded:  int         = 0
+def arrival_normal(t, mu, sigma):
+    """Normal (Gaussian) density, evaluated at times t."""
+    return norm.pdf(t, loc=mu, scale=sigma)
 
-    def record_arrival(self, t: float):                              # NEW
-        self.platform_arrivals.append(t)
+def arrival_uniform(t, t_start=0, t_end=None):
+    """Uniform density from t_start to t_end."""
+    if t_end is None:
+        t_end = LAST_DEPARTURE
+    inside = (t >= t_start) & (t <= t_end)
+    density = np.zeros_like(t, dtype=float)
+    density[inside] = 1.0 / (t_end - t_start)
+    return density
 
-    def record_wait(self, wait: float):
-        self.wait_times.append(wait)
 
-    def record_departure(self, t: float, load: int, queue_remaining: int):
-        self.train_loads.append(load)
-        self.departure_times.append(t)
-        self.arrival_times_ss.append(t + TRAVEL_TIME_MIN)
-        self.queue_at_departure.append(queue_remaining)
-        self.passengers_boarded += load
+from scipy.integrate import cumulative_trapezoid
 
-    def summary(self) -> Dict:
-        if not self.wait_times:
-            return {"error": "No passengers recorded"}
-        return {
-            "total_trains_dispatched":   len(self.train_loads),
-            "passengers_boarded":        self.passengers_boarded,
-            "passengers_stranded":       self.passengers_stranded,
-            "avg_train_load":            round(np.mean(self.train_loads), 1),
-            "trains_at_full_capacity":   sum(1 for l in self.train_loads if l == TRAIN_CAPACITY),
-            "avg_wait_min":              round(np.mean(self.wait_times), 2),
-            "p95_wait_min":              round(np.percentile(self.wait_times, 95), 2),
-            "max_wait_min":              round(np.max(self.wait_times), 2),
-            "first_departure_min":       round(self.departure_times[0], 1)  if self.departure_times else None,
-            "last_departure_min":        round(self.departure_times[-1], 1) if self.departure_times else None,
-            "last_train_arrives_SS_min": round(self.arrival_times_ss[-1], 1) if self.arrival_times_ss else None,
-        }
+# ... (other code) ...
+
+def cumulative_arrivals(density, t, total=TOTAL_PASSENGERS):
+    """
+    Integrate density over t, then scale so A(T_MAX) = total passengers.
+    Returns a cumulative array aligned with t.
+    """
+    # Use cumulative_trapezoid to get the running integral
+    # initial=0 ensures the output array is the same length as t
+    running = cumulative_trapezoid(density, t, initial=0)
+    
+    # Scale the curve so the final value matches your total passenger count
+    if running[-1] > 0:
+        return (running / running[-1]) * total
+    return running
+
 
 # ─────────────────────────────────────────────
-# SIMPY PROCESSES
+# CUMULATIVE DEPARTURE CURVE  D(t)
 # ─────────────────────────────────────────────
 
-def passenger_generator(env: simpy.Environment,
-                         platform: simpy.Resource,
-                         metrics: ReturnMetrics,
-                         lam_per_min: float,
-                         start_time: float = 0.0):
+def cumulative_departures(cum_arr, t, train_departs=TRAIN_DEPARTS,
+                           capacity=TRAIN_CAPACITY):
     """
-    Generates passengers with a time-varying rate to model the post-game surge:
-      - t=0 to t=30 (pre-service): slow trickle as fans exit the stadium
-      - t=30 (whistle + service start): large surge as crowd floods platform
-      - t=30 onward: rate decays exponentially as crowd thins out
+    Step-function departure curve: each train boards min(queue, capacity) passengers.
+    Queue at train i departure = cum_arr(t_depart_i) - passengers already boarded.
     """
-    yield env.timeout(start_time)
+    dep = np.zeros(len(t))
+    total_boarded = 0
+    schedule = []   # (departure_time, cumulative_boarded_after_this_train)
 
-    while True:
-        t = env.now
+    for d_time in train_departs:
+        # How many passengers have arrived by this train's departure?
+        idx = np.searchsorted(t, d_time)
+        arrived_so_far = cum_arr[min(idx, len(cum_arr) - 1)]
+        queue = arrived_so_far - total_boarded
+        this_train = min(queue, capacity)
+        total_boarded += this_train
+        schedule.append((d_time, total_boarded))
 
-        # Surge model: peak at service start, exponential decay afterward
-        # Before service: slow trickle at 20% of base rate
-        # After whistle: spike to 3x base rate, decaying with half-life of 20 min
-        if t < WHISTLE_TO_SERVICE:
-            effective_lam = lam_per_min * 0.20
-        else:
-            time_since_service = t - WHISTLE_TO_SERVICE
-            effective_lam = lam_per_min * 3.0 * math.exp(-0.035 * time_since_service)
-            effective_lam = max(effective_lam, lam_per_min * 0.05)  # floor: trickle never stops
+    # Build step curve
+    for i, tv in enumerate(t):
+        boarded = 0
+        for (d_time, cum_b) in schedule:
+            if tv >= d_time:
+                boarded = cum_b
+        dep[i] = boarded
 
-        inter_arrival = random.expovariate(effective_lam)
-        yield env.timeout(inter_arrival)
-        env.process(passenger_process(env, platform, metrics))
-
-def passenger_process(env: simpy.Environment,
-                       platform: simpy.Resource,
-                       metrics: ReturnMetrics):
-    """
-    A single returning passenger: arrives, joins FCFS queue, boards next train.
-    """
-    arrive_time = env.now
-    metrics.record_arrival(arrive_time)   # NEW: log platform arrival timestamp
-    with platform.request() as req:
-        yield req
-        wait = env.now - arrive_time
-        metrics.record_wait(wait)
-        yield env.timeout(0)  # boarding absorbed into train dwell
+    return dep, schedule
 
 
-def train_dispatcher(env: simpy.Environment,
-                      platform: simpy.Resource,
-                      metrics: ReturnMetrics,
-                      service_start: float,
-                      headway_min: float,
-                      num_trains: int):
-    """
-    Dispatch num_trains return trains on a fixed headway starting at service_start.
-    After all trains depart, record stranded passengers.
-    """
-    # Wait until service begins (30 min after whistle)
-    yield env.timeout(service_start)
-
-    for train_id in range(1, num_trains + 1):
-        env.process(train_service(env, platform, metrics, f"Return Train {train_id}"))
-        if train_id < num_trains:
-            yield env.timeout(headway_min)  # wait before dispatching next
-
-    # After last train dispatched, record stranded passengers
-    # Give the last train time to finish dwell before counting
-    yield env.timeout(DWELL_TIME_MIN + 1)
-    metrics.passengers_stranded = len(platform.queue)
-
-def train_service(env: simpy.Environment,
-                   platform: simpy.Resource,
-                   metrics: ReturnMetrics,
-                   name: str):
-    arrive = env.now
-    queue_before = len(platform.queue)
-    print(f"  [{arrive:6.1f} min] {name} ready for boarding | Queue: {queue_before}")
-
-    # Board passengers one by one up to train capacity during dwell
-    boarded = 0
-    boarding_events = []
-    while boarded < TRAIN_CAPACITY and len(platform.queue) > 0:
-        boarding_events.append(platform.queue[0].proc)
-        boarded += 1
-
-    yield env.timeout(DWELL_TIME_MIN)
-
-    load = min(queue_before, TRAIN_CAPACITY)
-    queue_remaining = len(platform.queue)
-    metrics.record_departure(env.now, load, queue_remaining)
-
-    print(f"  [{env.now:6.1f} min] {name} departs | Boarded: {load} "
-          f"| Queue remaining: {queue_remaining} "
-          f"| Arrives SS: {env.now + TRAVEL_TIME_MIN:.1f} min")
 # ─────────────────────────────────────────────
-# CUMULATIVE DEPARTURE PLOT
+# PLOTTING
 # ─────────────────────────────────────────────
-def plot_cumulative_departures(metrics: ReturnMetrics,
-                                lam_per_min: float,
-                                save_path: str = "return_departures.png"):
+
+COLORS = {
+    "arrival":   "#1a6bbd",   # blue
+    "departure": "#d85a30",   # coral/orange
+    "fill":      "#1a6bbd",
+    "train":     "#aaaaaa",   # gray dashed verticals
+}
+
+def plot_scenario(ax, cum_arr, cum_dep, title, subtitle):
     """
-    Two lines:
-      - Orange: cumulative passenger arrivals to Foxboro platform
-      - Blue:   cumulative passengers that actually board and depart
-    X-axis: minutes after final whistle
-    Y-axis: cumulative passengers
+    Draw A(t) and D(t) on ax, with vertical dashed lines for each train.
     """
-    # ── Arrival curve ─────────────────────────────────────────────
-    arrival_times_sorted = np.sort(metrics.platform_arrivals)
-    cum_arrivals = np.arange(1, len(arrival_times_sorted) + 1)
+    # Shade gap between A(t) and D(t)  →  represents queue / total wait
+    ax.fill_between(T, cum_arr, cum_dep,
+                     where=(cum_arr >= cum_dep),
+                     color=COLORS["arrival"], alpha=0.08, label="_nolegend_")
 
-    # ── Boarding staircase ────────────────────────────────────────
-    loads     = np.array(metrics.train_loads)
-    dep_times = np.array(metrics.departure_times)
-    cum_boarded = np.cumsum(loads)
+    # A(t) — cumulative arrivals
+    ax.plot(T, cum_arr, color=COLORS["arrival"], lw=2, label="A(t)  cumulative arrivals")
 
-    # Prepend zero so staircase starts at origin
-    dep_times_plot  = np.concatenate([[0], dep_times])
-    cum_boarded_plot = np.concatenate([[0], cum_boarded])
+    # D(t) — cumulative departures (step)
+    ax.step(T, cum_dep, where="pre", color=COLORS["departure"], lw=2.5,
+            label="D(t)  cumulative departures")
 
-    fig, ax = plt.subplots(figsize=(12, 7), facecolor="#0d1117")
-    ax.set_facecolor("#0d1117")
-    ax.tick_params(colors="white")
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#30363d")
-    ax.grid(True, color="#21262d", linewidth=0.7, linestyle="--")
+    # Vertical lines for each train departure
+    for i, td in enumerate(TRAIN_DEPARTS):
+        ax.axvline(td, color=COLORS["train"], lw=0.8, ls="--", alpha=0.6)
+        # Label trains 1, 3, 5, 7, 9, 11, 13, 14 to avoid clutter
+        if i % 2 == 0 or i == NUM_TRAINS - 1:
+            ax.text(td + 0.5, ax.get_ylim()[1] * 0.97,
+                    f"T{i+1}", fontsize=7, color="#888888",
+                    ha="left", va="top")
 
-    # Orange: arrivals to platform
-    ax.plot(arrival_times_sorted, cum_arrivals,
-            color="#f78166", linewidth=2.0, label="Cumulative arrivals to platform")
+    ax.set_title(title, fontsize=11, fontweight="bold", pad=6)
+    ax.set_xlabel("Minutes after final whistle", fontsize=9)
+    ax.set_ylabel("Cumulative passengers", fontsize=9)
+    ax.set_xlim(0, T_MAX)
+    ax.set_ylim(0, TOTAL_PASSENGERS * 1.05)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v/1000:.0f}k"))
+    ax.xaxis.set_major_locator(mticker.MultipleLocator(30))
+    ax.legend(fontsize=8, loc="upper left")
+    ax.grid(True, ls=":", alpha=0.4)
+    ax.text(0.99, 0.04, subtitle, transform=ax.transAxes,
+            fontsize=8, color="#666666", ha="right", va="bottom",
+            style="italic")
 
-    # Blue: passengers that board each train (staircase steps up by load per train)
-    ax.step(dep_times_plot, cum_boarded_plot, where="post",
-            color="#58a6ff", linewidth=2.5, label="Cumulative passengers boarded")
 
-    # Annotate each step with train number and load
-    for i, (t, c, load) in enumerate(zip(dep_times, cum_boarded, loads)):
-        ax.annotate(f"T{i+1}: {load} pax",
-                    xy=(t, c), xytext=(t + 0.5, c + 15),
-                    fontsize=7, color="#8b949e",
-                    arrowprops=dict(arrowstyle="-", color="#30363d", lw=0.6))
+def plot_all_scenarios():
+    # ── Scenario 1: Normal peak at t=30 (σ=22 min) ──
+    d1 = arrival_normal(T, mu=FIRST_DEPARTURE, sigma=22)
+    ca1 = cumulative_arrivals(d1, T)
+    cd1, _ = cumulative_departures(ca1, T)
 
-    # Vertical markers
-    ax.axvline(0, color="#3fb950", linewidth=1.0, linestyle=":",
-               label="Final whistle (t=0)")
-    ax.axvline(WHISTLE_TO_SERVICE, color="#e3b341", linewidth=1.0, linestyle=":",
-               label=f"First train (+{WHISTLE_TO_SERVICE} min)")
+    # ── Scenario 2: Normal peak at train 7 departure (t=120, σ=28 min) ──
+    train7_time = FIRST_DEPARTURE + 6 * HEADWAY_MIN   # 120 min
+    d2 = arrival_normal(T, mu=train7_time, sigma=28)
+    ca2 = cumulative_arrivals(d2, T)
+    cd2, _ = cumulative_departures(ca2, T)
 
-    ax.set_xlabel("Minutes after final whistle", color="white")
-    ax.set_ylabel("Cumulative passengers", color="white")
-    ax.set_title("MBTA Foxboro Return Service — 2026 FIFA World Cup\n"
-                 "Platform Arrivals vs. Passengers Boarded",
-                 color="white", fontsize=13, fontweight="bold")
-    ax.legend(facecolor="#161b22", edgecolor="#30363d", labelcolor="white", fontsize=10)
-    ax.tick_params(colors="white")
-    ax.xaxis.set_major_locator(mticker.MultipleLocator(5))
+    # ── Scenario 3: Uniform arrivals across full service window ──
+    d3 = arrival_uniform(T, t_start=0, t_end=LAST_DEPARTURE)
+    ca3 = cumulative_arrivals(d3, T)
+    cd3, _ = cumulative_departures(ca3, T)
+
+    # ── Figure ──
+    fig, axes = plt.subplots(3, 1, figsize=(12, 14), facecolor="#ffffff")
+    fig.suptitle(
+        "MBTA Foxboro → South Station  |  Post-Game Cumulative Arrival & Departure Diagrams\n"
+        f"14 trains  ·  {TRAIN_CAPACITY:,} pax/train  ·  {TOTAL_PASSENGERS:,} total  "
+        f"·  First departure t=30 min  ·  15-min headway",
+        fontsize=11, fontweight="bold", y=1.005
+    )
+
+    plot_scenario(
+        axes[0], ca1, cd1,
+        title="Scenario 1 — Early surge: Normal peak at t = 30 min (first departure)",
+        subtitle="Most fans rush to the platform immediately; queue clears quickly"
+    )
+    plot_scenario(
+        axes[1], ca2, cd2,
+        title=f"Scenario 2 — Late surge: Normal peak at t = {train7_time} min (train 7 departure)",
+        subtitle="Fans linger in stadium; large backlog builds then clears after midpoint"
+    )
+    plot_scenario(
+        axes[2], ca3, cd3,
+        title="Scenario 3 — Uniform arrivals across full 14-train service window",
+        subtitle="Steady trickle throughout; departure curve tracks A(t) closely but with constant lag"
+    )
 
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="#0d1117")
-    print(f"\n  Plot saved → {save_path}")
-    import os
-plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="#0d1117")
-print(f"  File exists after save: {os.path.exists(save_path)}")
-print(f"  File size: {os.path.getsize(save_path)} bytes")
-print(f"  Saved to: {os.path.abspath(save_path)}")
-plt.show()
+    plt.savefig("foxboro_cumulative_diagrams.png", dpi=150, bbox_inches="tight")
+    print("Saved: foxboro_cumulative_diagrams.png")
+    plt.show()
+
+
+if __name__ == "__main__":
+    plot_all_scenarios()
